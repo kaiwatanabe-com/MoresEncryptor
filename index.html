@@ -1,0 +1,247 @@
+<!DOCTYPE html>
+<html lang="en">
+<head><meta charset="utf-8"/><meta name="viewport" content="width=device-width,initial-scale=1"/>
+<title>Morse Encryptor — AES-256-GCM + Base32 wire (fix)</title>
+<style>
+  :root{--bg:#0b1220;--panel:#0f172a;--ink:#e5e7eb;--muted:#94a3b8}
+  *{box-sizing:border-box}html,body{height:100%}
+  body{margin:0;font-family:ui-sans-serif,system-ui,-apple-system,Segoe UI,Roboto,"Helvetica Neue",Arial;color:var(--ink);
+       background:radial-gradient(1200px 700px at 80% -10%,#0e2150,transparent),linear-gradient(180deg,#0b1220,#0b1426);
+       padding:22px;display:flex;align-items:center;justify-content:center}
+  .wrap{width:min(1100px,100%);background:color-mix(in oklab,var(--panel)96%,black 4%);border:1px solid rgba(255,255,255,.08);
+        border-radius:18px;box-shadow:0 10px 40px rgba(0,0,0,.35);padding:18px}
+  header{display:flex;align-items:center;justify-content:space-between;margin-bottom:10px}
+  h1{margin:0;font-size:18px}.note{font-size:12px;color:var(--muted)}
+  .cols{display:grid;grid-template-columns:1fr 1fr;gap:16px}@media(max-width:900px){.cols{grid-template-columns:1fr}}
+  .card{border:1px solid rgba(255,255,255,.08);border-radius:14px;padding:14px;display:grid;gap:10px}
+  label{font-size:12px;color:var(--muted);display:block;margin-bottom:6px}
+  textarea,input,select{width:100%;background:#0c1730;color:var(--ink);border:1px solid rgba(255,255,255,.12);
+    border-radius:10px;padding:10px 12px;font-family:ui-monospace,SFMono-Regular,Menlo,Consolas,"Courier New";font-size:13px;line-height:1.5;resize:vertical;min-height:56px}
+  .row{display:flex;gap:10px;align-items:center;flex-wrap:wrap}.row>*{flex:1}
+  .btn{appearance:none;border:1px solid rgba(255,255,255,.16);background:#0f203f;color:var(--ink);padding:8px 12px;border-radius:10px;cursor:pointer;font-size:13px}
+  .btn:hover{background:#11244a}.tight{min-height:unset}
+</style>
+</head>
+<body>
+<div class="wrap">
+  <header>
+    <h1>Morse Encryptor</h1>
+    <div class="note">AES-256-GCM (PBKDF2). Morse wire alphabet default = <b>Base32</b> (case-agnostic). Base64 also supported.</div>
+  </header>
+
+  <section class="cols">
+    <!-- ENCRYPT -->
+    <div class="card">
+      <strong>Encrypt & Encode (Text → Cipherbytes → Base32/Base64 → Morse)</strong>
+      <label for="plain">Plaintext</label>
+      <textarea id="plain" placeholder="Type your message…"></textarea>
+
+      <div class="row">
+        <div>
+          <label for="pass">Password</label>
+          <input id="pass" type="password" class="tight" placeholder="Required"/>
+        </div>
+        <div>
+          <label for="iters">PBKDF2 iterations</label>
+          <input id="iters" type="number" min="60000" step="1000" value="300000" class="tight"/>
+        </div>
+      </div>
+
+      <div class="row">
+        <div>
+          <label for="wire">Wire Encoding (for Morse)</label>
+          <select id="wire">
+            <option value="b32" selected>Base32 (recommended)</option>
+            <option value="b64">Base64 (case-sensitive; only use if not sending via Morse)</option>
+          </select>
+        </div>
+        <div class="note">Base32 avoids case loss in Morse; prevents AES tag failures.</div>
+      </div>
+
+      <div class="row"><button class="btn" id="doEnc">Encrypt → Wire & Morse</button><div id="encStatus" class="note"></div></div>
+
+      <label for="wireOut">Wire text (Base32/Base64)</label>
+      <textarea id="wireOut" readonly></textarea>
+
+      <label for="morseOut">Morse (letters sep by space, words by /)</label>
+      <textarea id="morseOut" readonly></textarea>
+    </div>
+
+    <!-- DECRYPT -->
+    <div class="card">
+      <strong>Decode & Decrypt (Morse/Wire → Cipherbytes → Text)</strong>
+      <label for="morseIn">Paste Morse (or leave empty and paste wire text below)</label>
+      <textarea id="morseIn" placeholder=".- .- ... / ... etc"></textarea>
+
+      <label for="wireIn">Or paste wire text (Base32/Base64)</label>
+      <textarea id="wireIn" placeholder="MCE1… (Base32 or Base64)"></textarea>
+
+      <div class="row">
+        <div>
+          <label for="passDec">Password</label>
+          <input id="passDec" type="password" class="tight" placeholder="Required"/>
+        </div>
+        <div>
+          <label for="itersDec">PBKDF2 iterations (fallback)</label>
+          <input id="itersDec" type="number" min="60000" step="1000" value="300000" class="tight"/>
+        </div>
+      </div>
+
+      <div class="row"><button class="btn" id="doDec">Decode & Decrypt</button><div id="decStatus" class="note"></div></div>
+
+      <label for="plainOut">Plaintext</label>
+      <textarea id="plainOut" readonly></textarea>
+    </div>
+  </section>
+
+  <p class="note" style="margin-top:10px">Header: <b>MCE1</b>|alg(01 AES-GCM)|iters|salt|iv|cipher; Morse decoder auto-detects Base32/Base64.</p>
+</div>
+
+<script>
+/* ===== bytes/base64/base32 ===== */
+const enc = new TextEncoder(), dec = new TextDecoder();
+const u8 = n=>new Uint8Array(n);
+const cat = (...a)=>{let n=a.reduce((s,x)=>s+x.length,0),o=u8(n),p=0;for(const x of a){o.set(x,p);p+=x.length}return o;}
+const i32be = n=>new Uint8Array([(n>>>24)&255,(n>>>16)&255,(n>>>8)&255,n&255]);
+const u32be = b=>(b[0]<<24)|(b[1]<<16)|(b[2]<<8)|b[3];
+
+function toB64(bytes){let s='';for(const x of bytes)s+=String.fromCharCode(x);return btoa(s);}
+function fromB64(b64){const s=atob(b64);const out=u8(s.length);for(let i=0;i<s.length;i++)out[i]=s.charCodeAt(i);return out;}
+
+/* RFC 4648 Base32 (uppercase) */
+const B32ABC = "ABCDEFGHIJKLMNOPQRSTUVWXYZ234567";
+const B32MAP = Object.fromEntries([...B32ABC].map((c,i)=>[c,i]));
+function toB32(bytes){
+  let out='', i=0, bits=0, val=0;
+  while(i<bytes.length){
+    val=(val<<8)|bytes[i++]; bits+=8;
+    while(bits>=5){ out+=B32ABC[(val>>(bits-5))&31]; bits-=5; }
+  }
+  if(bits>0){ out+=B32ABC[(val<<(5-bits))&31]; }
+  while(out.length%8) out+='='; // pad
+  return out;
+}
+function fromB32(str){
+  const s=(str||'').toUpperCase().replace(/=+$/,'');
+  let bits=0, val=0, out=[];
+  for(const ch of s){
+    const v=B32MAP[ch]; if(v===undefined) throw new Error("invalid base32");
+    val=(val<<5)|v; bits+=5;
+    if(bits>=8){ out.push((val>>(bits-8))&255); bits-=8; }
+  }
+  return new Uint8Array(out);
+}
+
+/* ===== Morse (robust tokens) ===== */
+const MAP = {"A":".-","B":"-...","C":"-.-.","D":"-..","E":".","F":"..-.","G":"--.","H":"....","I":"..","J":".---","K":"-.-","L":".-..","M":"--","N":"-.","O":"---","P":".--.","Q":"--.-","R":".-.","S":"...","T":"-",
+"U":"..-","V":"...-","W":".--","X":"-..-","Y":"-.--","Z":"--..","0":"-----","1":".----","2":"..---","3":"...--","4":"....-","5":".....","6":"-....","7":"--...","8":"---..","9":"----.","+":".-.-.","/":"-..-.","=":"-...-"};
+for(const k of Object.keys(MAP)){MAP[k.toLowerCase()]=MAP[k]}
+const RMAP = Object.fromEntries(Object.entries(MAP).map(([k,v])=>[v,k])); // returns original case key (could be lower)
+
+function textToMorsePreserve(str){ // no forced uppercasing
+  const words=(str||'').split(/\s+/).filter(Boolean);
+  return words.map(w=>Array.from(w).map(ch=>MAP[ch]||MAP[ch.toUpperCase()]||'').filter(Boolean).join(' ')).join(' / ');
+}
+function normalizeMorse(s){
+  return (s||'')
+    .replace(/[·•∙]/g,".").replace(/[–—−]/g,"-").replace(/[⁄∕]/g,"/")
+    .replace(/\|+/g," / ").replace(/\/\s*\//g," / ")
+    .replace(/[^\.\-\/\s]/g," ").replace(/\s+/g," ").trim();
+}
+function morseToTextRaw(morse){ // returns letter string as keyed
+  const nm=normalizeMorse(morse); if(!nm) return "";
+  const words=nm.split(/\s*\/\s*/); const letters=[];
+  for(const w of words){
+    const syms=w.trim().split(/\s+/).filter(Boolean);
+    for(const sym of syms){ const ch=RMAP[sym]; if(!ch) throw new Error(`bad token "${sym}"`); letters.push(ch); }
+    letters.push(" "); // word space
+  }
+  return letters.join('').trim();
+}
+
+/* ===== Crypto (AES-GCM + PBKDF2) ===== */
+const MAGIC = enc.encode("MCE1"); const ALG={AES:1};
+async function kdf(pass,salt,iters,len=256){
+  const km=await crypto.subtle.importKey("raw",enc.encode(pass),"PBKDF2",false,["deriveBits"]);
+  const bits=await crypto.subtle.deriveBits({name:"PBKDF2",salt,iterations:iters,hash:"SHA-256"},km,len);
+  return new Uint8Array(bits);
+}
+async function aesEnc(plain, pass, iters){
+  const salt=crypto.getRandomValues(u8(16)), iv=crypto.getRandomValues(u8(12));
+  const keyBytes=await kdf(pass,salt,iters,256);
+  const key=await crypto.subtle.importKey("raw",keyBytes,{name:"AES-GCM",length:256},false,["encrypt"]);
+  const ct=new Uint8Array(await crypto.subtle.encrypt({name:"AES-GCM",iv},key,enc.encode(plain)));
+  const header=cat(MAGIC,new Uint8Array([ALG.AES]),i32be(iters),salt,iv);
+  return cat(header,ct); // return BYTES (not base64)
+}
+async function aesDec(bytes, pass, itersFallback){
+  if(bytes.length<4+1+4+16+12) throw new Error("cipher too short");
+  if(String.fromCharCode(...bytes.slice(0,4))!=="MCE1") throw new Error("bad header");
+  if(bytes[4]!==ALG.AES) throw new Error("wrong alg");
+  const iters=u32be(bytes.slice(5,9))||itersFallback;
+  const salt=bytes.slice(9,25), iv=bytes.slice(25,37), ct=bytes.slice(37);
+  const keyBytes=await kdf(pass,salt,iters,256);
+  const key=await crypto.subtle.importKey("raw",keyBytes,{name:"AES-GCM",length:256},false,["decrypt"]);
+  const pt=await crypto.subtle.decrypt({name:"AES-GCM",iv},key,ct);
+  return dec.decode(pt);
+}
+
+/* ===== UI ===== */
+const $=id=>document.getElementById(id);
+
+// Encrypt
+$("doEnc").addEventListener("click", async ()=>{
+  const pass=$("pass").value||"", iters=Math.max(60000,(+$("iters").value||300000));
+  $("encStatus").textContent="";
+  if(!pass){$("encStatus").textContent="Password required.";return;}
+  try{
+    const bytes=await aesEnc(($("plain").value||""),pass,iters);
+    const wireSel=$("wire").value;
+    const wire = wireSel==="b32" ? toB32(bytes) : toB64(bytes);
+    $("wireOut").value=wire;
+    $("morseOut").value=textToMorsePreserve(wire); // case-agnostic when Base32
+    $("encStatus").textContent= wireSel==="b32" ? "Encrypted → Base32 → Morse." : "Encrypted → Base64 → Morse (case-sensitive!).";
+  }catch(e){$("encStatus").textContent="Encrypt error: "+(e.message||e);}
+});
+
+// Decrypt
+$("doDec").addEventListener("click", async ()=>{
+  const pass=$("passDec").value||"", itersF=Math.max(60000,(+$("itersDec").value||300000));
+  $("decStatus").textContent="";
+  if(!pass){$("decStatus").textContent="Password required.";return;}
+  try{
+    let wire = ($("wireIn").value||"").trim();
+    if(!wire){
+      const morse=($("morseIn").value||"").trim(); if(!morse){$("decStatus").textContent="Provide Morse or wire text.";return;}
+      try{ wire = morseToTextRaw(morse); }catch(err){ $("decStatus").textContent = `Morse error: ${(err.message||err)} (letters by space, words by /)`; return; }
+    }
+    wire = wire.replace(/\s+/g,"");
+
+    // Auto-detect Base32 vs Base64 by trying to parse header after decode
+    let bytes=null, ok=false, errMsg="";
+    // Try Base32 first (recommended)
+    try{
+      const b32bytes = fromB32(wire);
+      if(String.fromCharCode(...b32bytes.slice(0,4))==="MCE1"){ bytes=b32bytes; ok=true; }
+    }catch(e){ errMsg = e.message; }
+    // If not Base32, try Base64
+    if(!ok){
+      try{
+        const b64bytes = fromB64(wire.replace(/-/g,'+').replace(/_/g,'/'));
+        if(String.fromCharCode(...b64bytes.slice(0,4))==="MCE1"){ bytes=b64bytes; ok=true; }
+      }catch(e){ /* ignore */ }
+    }
+    if(!ok){ $("decStatus").textContent="Unknown wire alphabet (not Base32/Base64 with MCE1 header)."; return; }
+
+    const plain = await aesDec(bytes, pass, itersF);
+    $("plainOut").value=plain;
+    $("decStatus").textContent="Decrypted.";
+  }catch(e){
+    const msg=(e&&e.message)||String(e);
+    let hint=""; if(/OperationError/i.test(msg)) hint=" (wrong password or altered Morse).";
+    $("decStatus").textContent="Decrypt error: "+msg+hint;
+  }
+});
+</script>
+</body>
+</html>
